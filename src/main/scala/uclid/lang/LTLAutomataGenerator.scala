@@ -171,14 +171,16 @@ class LTLAutomataConnectorPass(val mainModuleName: Identifier)
     */
   def connectModules(origin: Module, automata: Module): Module = {
     // println("Ofek Debug: " + origin.decls.length)
-    /** Steps: 1: Identify all variables in the automata module that need to be
+    /** Steps: 
+      * 1: Identify all variables in the automata module that need to be
       * copied in. (look for all 'input' vars, module function imports, module
       * synth function imports) (maps of these can be found in
-      * origin.moduleType) 2: Switch all 'vars' that we need from main module
+      * origin.moduleType) 
+      * 2: Switch all 'vars' that we need from main module
       * into an output-okay form. (if a needed var is a normal var, make it an
       * output var) (if a needed var is an input var, make it a shared var) (if
-      * a needed var is already an output var, leave it as-is) 3: TODO:
-      * Something, something, functions. Somehow we need to be able to do this,
+      * a needed var is already an output var, leave it as-is) 
+      * 3: TODO: Something, something, functions. Somehow we need to be able to do this,
       * but I don't know how.
       */
 
@@ -219,150 +221,90 @@ class LTLAutomataConnectorPass(val mainModuleName: Identifier)
   * by it.
   */
 object SpotInterface {
-
-  // list of all characters which require the surrounding area to be quoted
-  // TODO: figure out if '-' is actually valid -- if so it will need to be handled differently.
-  val forbiddenChars = "+-/*%<>=".toCharArray()
-
-  /** returns an intervals of tuples describing ranges of a single parenthesis
-    * set. returns tuple(int, int, int), where int 1 is index of openChar
-    * instance, int 2 is index of closeChar, and int 3 is absolute depth
-    *
-    * Mostly serves as a utility function for rewriteFormulaForSpot
+  /** 
+    * Print out an Expression instance in a Spot-friendly manner
+    * (Spot can only support LTL and Boolean operators, Expr subtrees containing 
+    * forbidden Operators are wrapped in quotes so that Spot sees the sub-expression as a variable)
     */
-  def getParenRanges(
-      string: String,
-      openChar: Char,
-      closeChar: Char
-  ): ArrayBuffer[(Int, Int, Int)] = {
-    // TODO: Stack is depreicated -- replace this with ArrayDeque and change pop/push methods accordingly.
-    var openIndices = Stack[Int]()
-    // the tuple stores index of '(', index of ')', and the depth of the pair
-    var pairIndices = ArrayBuffer[(Int, Int, Int)]()
-    // First, build a collection of all parenthesis pairs in the set.
-    for (i <- 0 until string.length) {
-      if (string(i) == openChar) {
-        openIndices.push(i)
-      } else if (string(i) == closeChar) {
-        val oIndex = openIndices.pop()
-        val depth = openIndices.length
+  def rewriteFormulaForSpot(formula: Expr): String = {
+    
+    /**
+     * LTL Operators
+     *  - GloballyTemporalOp (G)
+     *  - NextTemporalOp (X)
+     *  - UntilTemporalOp (U)
+     *  - FinallyTemporalOp (F)
+     *  - ReleaseTemporalOp (R)
+     *  - WUntilTemporalOp (W)
+     * 
+     * Boolean Operators -- these can be unquoted, but need to be rewritten to Spot's
+     *    ... preferred syntax.
+     *  - ConjunctionOp ("&&", changed to "&")
+     *  - DisjunctionOp ("||", changed to "|")
+     *  - NegationOp ("!", kept unchanged.)
+     *  - IffOp ("<==>", changed to "<->")
+     *  - ImplicationOp ("==>", changed to "->")
+     *  - The "XOR" operator is also technically allowed, but I can't find it in the language file. (TODO)
+     * 
+     * Technically, opening and closing parenthesis "()" are allowed, too.
+     * 
+     * Everything else (including Identifiers) will need to be wrapped in quotes.
+     *  (If we don't wrap Identifiers, then an ID like "Glances" would be interpreted as "G(lances)")
+     */
 
-        pairIndices += ((oIndex, i, depth))
+    object QuotedExprPrinter {
+      // We use this to eliminate quotes within quotes
+      // (also, helps protect from stringlits messing things up, as they use \")
+      private def quote(s: String): String =
+        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+      // recursively traverses the expression, calling itself.
+      // Will ID all unquoteable expressions and quote all quoteable expressions
+      def print(e: Expr): String = e match {
+        // boolean logic
+        case OperatorApplication(NegationOp(), List(x)) => 
+          "!(" + print(x) + ")"
+
+        case OperatorApplication(ConjunctionOp(), ops) =>
+          "(" + ops.map(print).mkString(" & ") + ")"
+
+        case OperatorApplication(DisjunctionOp(), ops) =>
+          "(" + ops.map(print).mkString(" | ") + ")"
+
+        case OperatorApplication(ImplicationOp(), List(a, b)) =>
+          "(" + print(a) + " -> " + print(b) + ")"
+
+        case OperatorApplication(IffOp(), List(a, b)) =>
+          "(" + print(a) + " <-> " + print(b) + ")"
+
+        // LTL
+        case OperatorApplication(GloballyTemporalOp(), List(x)) =>
+          "G(" + print(x) + ")"
+
+        case OperatorApplication(FinallyTemporalOp(), List(x)) =>
+          "F(" + print(x) + ")"
+
+        case OperatorApplication(NextTemporalOp(), List(x)) =>
+          "X(" + print(x) + ")"
+
+        // Print binary temporal ops infix to avoid commas outside quotes
+        case OperatorApplication(UntilTemporalOp(), List(a, b)) =>
+          "(" + print(a) + " U " + print(b) + ")"
+
+        case OperatorApplication(ReleaseTemporalOp(), List(a, b)) =>
+          "(" + print(a) + " R " + print(b) + ")"
+
+        // include only if you want W outside quotes too
+        case OperatorApplication(WUntilTemporalOp(), List(a, b)) =>
+          "(" + print(a) + " W " + print(b) + ")"
+
+        // everything else becomes a quoted atom (captures [], ==, <, +, ., function calls, etc.)
+        case _ =>
+          quote(e.toString)
       }
     }
-    return pairIndices
-  }
 
-  /** prepare a given LTL formula string for use by spot by wrapping the
-    * contents of any parentheses pair in quotes if the content contains a
-    * character that Spot would not be able to handle (ie, any comparison or
-    * arithmatic operators, as well as []). For now we will default to any
-    * NON-alphanumeric character (except "()").
-    *
-    * Why do this? Spot only supports boolean operators and literals, but UCLID
-    * lets us input expressions that evaluate to boolean values. We need to find
-    * those expressions and encase them in strings so that Spot can treat them
-    * as just a variable.
-    *
-    * TODO: Spot does have a "lenient mode" that could do some of this. However
-    * it would treat some UCLID5 symbols differently to how we want to evaluate
-    * them in UCLID (ie, treating + as conjunction rather than addition). This
-    * quote inserttion method is sloppy -- if there is a way to use SPOT
-    * directly it would be better ALTERNATE TODO: Instead of traversing a string
-    * and scanning for chars, we could search the AST directly, search for
-    * operator applications of non-boolean ops, and then use that to determine
-    * whether to encase the expression in strings
-    */
-  def rewriteFormulaForSpot(formula: String): String = {
-
-    /** Process is as follows: 1: get a list of all parentheses and their depths
-      * 2: sort parentheses pairs in order of ascending depth 3: For each pair,
-      * iterate over all chars in the range.
-      *   - keep track of local depth variable
-      *   - if there exists forbidden character at 0 local depth, add paren
-      *     indices to "needs quotes" list
-      * 4: construct the new string by iterating through the old one and
-      * inserting new quotes as need be.
-      */
-    val pPairIndices = getParenRanges(formula, '(', ')')
-    val bPairIndices = getParenRanges(formula, '[', ']')
-
-    // sort the pairs from outermost to innermost (ascending depth order).
-    // If we find a non-boolean operator in one depth level, that means that all other expressions in deeper
-    // levels will need to be in the quote too, so we move from shallow to deep depths.
-    val sortedIndices = pPairIndices.sortBy(_._3)
-    // we need to keep track of already quoted ranges so we do not put quotes inside of quotes.
-    // we could technically refactor the system to use a parenthesis tree to not need this.
-    var quotedRanges = ArrayBuffer[(Int, Int)]()
-    var insertIndices = ArrayBuffer[
-      Int
-    ]() // indices at which to insert double quotes (we insert before the char)
-    for ((openIndex, closedIndex, depth) <- sortedIndices) {
-      // check to see if we're in an already quoted region. If we are, skip checking this set.
-      val isInsideQuoted: Option[(Int, Int)] = quotedRanges.find {
-        case ((otherOpen, otherClosed)) =>
-          otherOpen < openIndex && otherClosed > closedIndex
-      }
-      if (isInsideQuoted.isEmpty) { // ie, if we are in an unquoted region
-        // Check to see if the range needs to be quoted. If we ever need to change the
-        // logic for HOW we decide to quote something out, this is where that change needs to be made.
-        var localDepth: Int = 0
-        var hasForbiddenChar = false
-        var isVector = closedIndex < formula.length - 1 && formula(
-          closedIndex + 1
-        ) == '[' // is ) followed by [
-        for (i <- openIndex + 1 until closedIndex) {
-          val charToEval: Char = formula(i)
-          if (charToEval == '(') localDepth += 1
-          else if (charToEval == ')') localDepth -= 1
-          // we only want to check for forbidden characters at our current depth.
-          hasForbiddenChar =
-            localDepth == 0 && forbiddenChars.contains(formula(i))
-        }
-        if (hasForbiddenChar || isVector) {
-          val newOpen = if (isVector) openIndex else openIndex + 1
-          var newClosed = closedIndex
-          if (isVector) {
-            // find the closing ] to the [ following this paren set
-            while (
-              newClosed < formula.length - 1 && formula(newClosed + 1) == '['
-            ) {
-              // keep searching for the next ] as long as a [ is right after our range
-              newClosed = bPairIndices
-                .find(p => p._1 == newClosed + 1)
-                .map(_._2)
-                .getOrElse(formula.length)
-            }
-            newClosed += 1 // we need to put the quote after the final ]
-          }
-          insertIndices += newOpen
-          insertIndices += newClosed
-          quotedRanges += ((newOpen, newClosed))
-        }
-      }
-    }
-    // Now that we know where to insert quotes, create the new string
-    val sortedInsertIndices = insertIndices.sorted
-    val toReturn = new StringBuilder()
-    var insertionPointer = 0
-    // length +1 is so that we add any necessary quotes at the end of the string
-    for (i <- 0 until formula.length + 1) {
-      // as long as we have quotes to print, do those
-      while (
-        insertionPointer < sortedInsertIndices.length && sortedInsertIndices(
-          insertionPointer
-        ) == i
-      ) {
-        toReturn.append('\"')
-        insertionPointer += 1
-      }
-      // only add the original formula's character until all necessary preceeding quotes have been added.
-      if (i < formula.length) {
-        toReturn.append(formula(i))
-      }
-    }
-    // ta da
-    return toReturn.result()
+    return QuotedExprPrinter.print(formula)
   }
 
   /** returns the HOA representation of a TGBA created from the LTL formula in
@@ -371,7 +313,7 @@ object SpotInterface {
     */
   def runLTL2TGBA(formula: Expr): String = {
 
-    val spotFormula = rewriteFormulaForSpot(formula.toString())
+    val spotFormula: String = rewriteFormulaForSpot(formula)
     val spotCommand: Seq[String] =
       Seq("/home/oshani/usr/bin/ltl2tgba", "-B", "-f", spotFormula)
     val processBuilder: ProcessBuilder = spotCommand
@@ -650,19 +592,30 @@ object LTLAutomataGenerator {
     */
   class VariableTypeIdentifier(origin: Module) {
     // these are the possible types that need to be handled
-    sealed trait SymbolKind
-    case object Input extends SymbolKind
-    case object Output extends SymbolKind
-    case object StateVar extends SymbolKind
-    case object SharedVar extends SymbolKind
-    case object ConstantLit extends SymbolKind
-    case object Constant extends SymbolKind
-    case object Function extends SymbolKind
-    case object SynthFunc extends SymbolKind
-    case object Instance extends SymbolKind
-    case object CustomType
-        extends SymbolKind // would use "Type" here but it's reserved.
-    case object Unknown extends SymbolKind // bound variable, etc.
+    sealed trait SymbolKind {
+      // Whether or not the type requires an explicit declaration.
+      // if false, then this type can "safely" be None.
+      def needsDecl: Boolean
+    }
+    // These require an explicit 'input' or 'const' declaration
+    case object Input extends SymbolKind { val needsDecl = true }
+    case object Output extends SymbolKind { val needsDecl = true }
+    case object StateVar extends SymbolKind { val needsDecl = true }
+    case object SharedVar extends SymbolKind { val needsDecl = true }
+    case object ConstantLit extends SymbolKind { val needsDecl = true }
+    case object Constant extends SymbolKind { val needsDecl = true }
+
+    // These are handled by wildcard imports (type * = main.*; etc)
+    case object EnumConstant extends SymbolKind { val needsDecl = false }
+    case object CustomType extends SymbolKind { val needsDecl = false }
+    case object Function extends SymbolKind { val needsDecl = false }
+    case object SynthFunc extends SymbolKind { val needsDecl = false }
+
+    // These should be ignored or are errors
+    case object Instance extends SymbolKind { val needsDecl = false }
+    case object Unknown extends SymbolKind { val needsDecl = false }
+
+    
 
     // returns a SymbolKind indicating the Type of node in module "m" has the id "id"
     def classify(id: Identifier): SymbolKind = {
@@ -679,25 +632,39 @@ object LTLAutomataGenerator {
       else if (mt.instanceMap contains id) Instance
       else if (origin.typeDeclarationMap contains id)
         CustomType // TypeDecl is used already and Type is reserved word...
+      else if ((Scope.empty + origin).get(id).exists(_.isInstanceOf[Scope.EnumIdentifier])) EnumConstant
       else Unknown
+    }
+
+    def findTypeDeclForEnumConstant(id: Identifier): Option[TypeDecl] = {
+      origin.decls.collectFirst {
+        case td @ TypeDecl(_, EnumType(ids)) if ids.contains(id) => td
+      }
+    }
+
+    def getOriginalType(id: Identifier): Type = {
+      origin.decls.collectFirst {
+        case d: InputVarsDecl if d.ids.contains(id) => d.typ
+        case d: StateVarsDecl if d.ids.contains(id) => d.typ
+        case d: OutputVarsDecl if d.ids.contains(id) => d.typ
+        case d: SharedVarsDecl if d.ids.contains(id) => d.typ
+        case d: ConstantsDecl if d.ids.contains(id) => d.typ
+      }.getOrElse(origin.moduleType.typeOf(id).get)
     }
 
     // Given an ID of something in the main module, this will return a statement that can be used to copy it to somewhere else.
     // This will return a decl (input/shared var decl, constlit, import) depending on the var with the given ID.
     def toImportDecl(id: Identifier): Option[Decl] = {
       val mt = origin.moduleType
-      classify(id) match {
+      val kind = classify(id)
+      // if we don't need a Decl for this type, then we can safely return none!
+      if (!kind.needsDecl) return None
+
+      kind match {
         // all "var" types need to be fed as Inputs
         case Input | Output | StateVar | SharedVar =>
-          mt.typeOf(id) match {
-            case Some(t) => Some(InputVarsDecl(List(id), t))
-            case None    => {
-              System.err.println(
-                "Error: Variable " + id.toString() + " has no type."
-              )
-              None
-            }
-          }
+          val t = getOriginalType(id)
+          Some(InputVarsDecl(List(id), t))
         // we can just declare constants outright
         case ConstantLit => // constant literals (ex: 'const k = 5')
           Some(ConstantLitDecl(id, mt.constLitMap(id)))
@@ -708,13 +675,12 @@ object LTLAutomataGenerator {
           Some(ModuleFunctionsImportDecl(origin.id))
         case SynthFunc =>
           Some(ModuleSynthFunctionsImportDecl(origin.id))
-        // we can just copy type declarations
-        case CustomType =>
-          Some(TypeDecl(id, origin.typeDeclarationMap(id)))
         // TODO: If there is any type missing, add it here.
-        case Instance | Unknown => None
+        case _ => None
       }
     }
+
+    
   }
 
   /** @brief
@@ -845,7 +811,8 @@ object LTLAutomataGenerator {
   ): Option[Module] = {
 
     val spotTGBA: String = SpotInterface.runLTL2TGBA(spec.expr)
-
+    // print("Ofek Debug: Origin Module")
+    print(originModule.toString())
     // Top level process is as follows:
     // 0: parse HOA format -- isolate substrings with info on states, transitions, acceptance, etc
     // 1: Define variables
@@ -868,13 +835,21 @@ object LTLAutomataGenerator {
 
     // list of input var, function import, constant and type def declarations
     // should handle everything that we need from the TS module in order to run everything smoothly
+
+    // BIIIIG TODO: if we use enums, they are considered Identifiers and rolled into here.
+      // we need a way to differentiate enumeration values from normal Identifiers, and treat them differently
     val mapper = new VariableTypeIdentifier(originModule)
+    val typeImportDecl = ModuleTypesImportDecl(originModule.id)
     val compatVarDecls: Option[List[Decl]] = hoaData.moduleVarIdentifiers
-      .map(ids => ids.map(id => mapper.toImportDecl(id)).toList)
-      .flatMap { list =>
-        if (list.forall(_.isDefined)) Some(list.flatten)
-        else None
-      }
+      .map(ids => ids.flatMap{id => 
+        val decl = mapper.toImportDecl(id)
+        val kind = mapper.classify(id)
+        if(decl.isEmpty && kind.needsDecl) {
+          System.err.println(s"Error: Failed to generate required declaration for ${id} (Kind: ${kind})")
+        }
+        decl // the return stmt
+      }.toList.distinct)
+      
 
     val currentState = Identifier(spec.id + "_current_state")
     val currentStateVarDecl = StateVarsDecl(List(currentState), IntegerType())
@@ -1050,7 +1025,7 @@ object LTLAutomataGenerator {
         nextDecl <- nextDecl
         neverHitAcceptStateSpecDecl <- neverHitAcceptStateSpecDecl
         updateTransitionBitsDefinition <- updateTransitionBitsDefinition
-      } yield inputVarDecls ++ List[Decl](
+      } yield List[Decl](typeImportDecl) ++ inputVarDecls ++ List[Decl](
         currentStateVarDecl,
         initDecl,
         updateTransitionBitsDefinition,
