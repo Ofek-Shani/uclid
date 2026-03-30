@@ -178,8 +178,10 @@ object UclidMain {
   // New Function: generates a list of AutomataModules from the main module, then runs the compile pass on them to rewrite any weird... stuff.
   def getCompiledAutomataModules(compiledModules: List[Module], config: Config, mainModuleName: lang.Identifier, test: Boolean = false): List[Module] = {
     val passManager = createCompilePassManager(config, test, mainModuleName)
+    val context = compiledModules.foldLeft(Scope.empty)((acc, m) => acc +& m)
+    passManager.moduleList = compiledModules
     val automataModules: List[Module] = LTLAutomataGenerator.generateAllAutomata(compiledModules, mainModuleName).map(
-      m => passManager.run(List(m))(0)
+      m => passManager.run(m, context).get
     )
     return automataModules
   }

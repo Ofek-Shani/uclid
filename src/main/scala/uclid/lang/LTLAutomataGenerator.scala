@@ -684,116 +684,75 @@ object LTLAutomataGenerator {
   }
 
   /** @brief
-    *   Constructs the Procedure block that updates the value of the transition
-    *   bits. Modifies transitionBits such that bit "i" is a 1 if and only if
-    *   there exists a valid (and take-able) transition to... ... the i-th state
-    *   from the current state.
-    * @param hoaData:
-    *   the HOAData instance being used to genereate the automata module.
-    * @param currentStateIdentifier:
-    *   The identifier assigned to the currentState variable in the automata.
-    * @param transitionBitsIdentifier:
-    *   The identifier of the transitionBits data structure we need to fill in.
-    * @param procName
-    *   The identifier to assign the procedure name ID to.
+    *   Constructs a boolean expression representing the transition relation of the automaton.
+    * 
+    *   This function builds a declarative "Transition Relation" R(s, inputs, s'). 
+    *   In UCLID, s' is represented by the primed variable (GetNextValueOp).
+    *   The resulting expression is a massive disjunction of all possible valid steps:
+    *   R = \/_{s} (currentState == s && \/_{edge from s} (condition && (nextState == d1 || nextState == d2 ...)))
+    * 
+    *   This declarative approach is preferred over procedural code in the next block
+    *   because it avoids sequential assignment errors and is more efficient for SMT solvers.
+    * 
+    * @param hoaData The parsed HOA data containing the state transition table.
+    * @param currentStateIdentifier The identifier for the current state variable.
+    * @return An Option[Expr] containing the full transition relation formula.
     */
-  def constructTransitionBuilderProcedure(
+  def constructTransitionRelation(
       hoaData: HOAData,
-      currentStateIdentifier: Identifier,
-      procName: Identifier
-  ): Option[ProcedureDecl] = {
-    // 1. Identifiers
-    val argName = Identifier("current_state")
-    val returnBitsId = Identifier("transition_bits_return")
+      currentStateIdentifier: Identifier
+  ): Option[Expr] = {
+    // Helper to build a binary tree of operators (e.g., (a || (b || c)))
+    // This is necessary because the UCLID type checker requires exactly two arguments 
+    // for most boolean operators.
+    def binaryOpTree(ops: List[Expr], op: Operator, identity: Expr): Expr = {
+      ops match {
+        case Nil => identity
+        case List(single) => 
+          // Even for a single element, the type checker for Disjunction/Conjunction 
+          // usually expects two args, so we pair it with the identity.
+          OperatorApplication(op, List(single, identity))
+        case _ => 
+          ops.reduceRight((a, b) => OperatorApplication(op, List(a, b)))
+      }
+    }
 
-    // 2. Procedure Signature
-    // ProcedureSig(inParams: List[(Identifier,Type)], outParams: List[(Identifier,Type)])
-    val params: Option[List[(Identifier, Type)]] =
-      hoaData.moduleVarIdentifiers.map(_.map(id => (id, BooleanType())).toList)
-    // Construct the procedure header!
-    // Params is the set of atomics that Spot Identified (they are vars passed into the module)
-    // the output param is the transition bitvector that we're going to build
-    val sig: Option[ProcedureSig] = for {
-      params <- params
-      numStates <- hoaData.numStates
-    } yield ProcedureSig(
-      inParams = params,
-      outParams = List(
-        (returnBitsId, BitVectorType(numStates))
-      ) // List((returnBitsId, BitVectorType(numStates)))
-    )
+    // nextState represents 'currentStateIdentifier' (the value in the next step)
+    val nextState = OperatorApplication(GetNextValueOp(), List(currentStateIdentifier))
 
-    // 3. Modifies Set
-    // Must be a Set of ModifiableEntity (usually ModifiableId)
-    val modifiesSet = Set[ModifiableEntity]()
-
-    // 4. Preconditions (Requires) & Postconditions (Ensures) -- Empty for now
-    val reqs = List(
-    )
-    val ens = List(
-    )
-
-    val updateTransitionBits: Option[List[Statement]] =
-      hoaData.transitionsRaw.map(tRaw =>
-        tRaw.zipWithIndex.map { case (stateTrans, stateNum) =>
-
-          // Only run state n's checks if we're on state n.
-          val stateComparison = OperatorApplication(
-            EqualityOp(),
-            List(currentStateIdentifier, IntLit(stateNum))
+    // transitionsRaw is Option[List[List[(Expr, List[Int])]]]
+    // Outer List: Source States
+    // Inner List: Edges (Condition, List of Destinations)
+    hoaData.transitionsRaw.map { tRaw =>
+      val stateRelations: List[Expr] = tRaw.zipWithIndex.map { case (stateTrans, stateNum) =>
+        // 1. Identify if we are currently in this state: (currentState == stateNum)
+        val stateMatch = OperatorApplication(EqualityOp(), List(currentStateIdentifier, IntLit(stateNum)))
+        
+        // 2. Build the logic for all valid edges leaving this state.
+        // For each edge: (condition && (nextState == dest1 || nextState == dest2 || ...))
+        val edgeRelations: List[Expr] = stateTrans.map { case (cond, dests) =>
+          // Create matches for each destination state: (nextState == d)
+          val destMatches = dests.map(d =>
+            OperatorApplication(EqualityOp(), List(nextState, IntLit(d)))
           )
-          val perStateTransition: List[IfElseStmt] =
-            stateTrans.map { case (cond, dests) =>
-              // now it's per edge
-              // list of statements that turn on all destinations of the edge
-              val enableTransitions = dests.map(ds =>
-                AssignStmt(
-                  List(
-                    LhsSliceSelect(
-                      returnBitsId,
-                      ConstBitVectorSlice(ds, ds)
-                    )
-                  ),
-                  List(BitVectorLit(1, 1))
-                )
-              )
-              IfElseStmt(cond, BlockStmt(Nil, enableTransitions), SkipStmt())
-            }
-          IfElseStmt(
-            stateComparison,
-            BlockStmt(Nil, perStateTransition),
-            SkipStmt()
-          )
-
+          // Combine destination matches with OR using binary nesting
+          val destDisjunction = binaryOpTree(destMatches, DisjunctionOp(), BoolLit(false))
+          
+          // The edge is valid if its condition is met AND we move to a valid destination
+          OperatorApplication(ConjunctionOp(), List(cond, destDisjunction))
         }
-      )
-
-    val body: Option[BlockStmt] = updateTransitionBits.map(f =>
-      BlockStmt(
-        vars = List.empty,
-        stmts = f
-      )
-    )
-
-    // 6. Annotations (e.g., [inline] or [noinline])
-    // ProcedureAnnotations(ids : Set[Identifier])
-    val anns = ProcedureAnnotations(Set.empty)
-
-    val procedureToReturn: Option[ProcedureDecl] =
-      for {
-        sig <- sig
-        body <- body
-      } yield ProcedureDecl(
-        id = procName,
-        sig = sig,
-        body = body,
-        requires = reqs,
-        ensures = ens,
-        modifies = modifiesSet,
-        annotations = anns
-      )
-
-    return procedureToReturn
+        
+        // Combine all possible edges for this state with OR using binary nesting
+        val allEdgesForState = binaryOpTree(edgeRelations, DisjunctionOp(), BoolLit(false))
+        
+        // The transition is valid if (we are in this state) AND (we take a valid edge)
+        OperatorApplication(ConjunctionOp(), List(stateMatch, allEdgesForState))
+      }
+      
+      // The overall transition is valid if we take a valid step from ANY state.
+      // Combine all state-specific relations with OR using binary nesting.
+      binaryOpTree(stateRelations, DisjunctionOp(), BoolLit(false))
+    }
   }
 
   /** Constructs a UCLID representation of a generalized nondeterministic Buchi
@@ -888,92 +847,27 @@ object LTLAutomataGenerator {
         BlockStmt(Nil, List(initStateHavoc, initStateAssume))
       ) // both are Decl, list type is Decl
 
-    /** 3: Module Next Block (this one is a bit confusing) TLDR: evaluate all of
-      * the conditions for edges. Keep track of the destinations we can go to
-      * using a bitvector and then nondeterministically select the next state
-      * from set of possible destinations
+    /** 3: Module Next Block
+      *
+      * The next block defines how the automaton moves between states.
+      * We use a declarative transition relation: we havoc the state variable
+      * to allow it to take any value, and then use an 'assume' statement to
+      * restrict that value to only the valid transitions allowed by the current
+      * state and inputs.
       */
 
-    // we keep the set of valid transitions from the current state as a local bit vector, where each bit
-    // in the vector represents a state.
-    // if a state's corresponding bit is 1, there exists a traverable transition from the current state to that state.
-    val transitionBits = Identifier("validTransitions")
-    val transitionBitsDecl = hoaData.numStates.map(n =>
-      BlockVarsDecl(List(transitionBits), BitVectorType(n))
-    )
-
-    // define the update Transition Bits Function
-    val updateTransitionBitsId: Identifier = Identifier(
-      "get_next_states"
-    )
-    // Defines the procedure that updates the transition bits
-    // - This must be added outside of the next block
-    val updateTransitionBitsDefinition: Option[ProcedureDecl] =
-      constructTransitionBuilderProcedure(
-        hoaData,
-        currentState,
-        transitionBits
-      )
-    // call the update Transition Bits function
-    val updateTransitionBitsCall: Option[ProcedureCallStmt] =
-      hoaData.moduleVarIdentifiers.map(varIDs =>
-        ProcedureCallStmt(
-          id =
-            updateTransitionBitsId, // this is the ID defined in the function.
-          callLhss = List(LhsId(transitionBits)),
-          args = varIDs.toList,
-          instanceId = None,
-          moduleId = None
-        )
-      )
-
-    // Now assign the next state. We use a havoc that is limited by 2 assumes:
-    // 1: that the havoc is within range of the vector
-    // 2: that the bit indexed by the next state havoc is 1 (ie we can go to that state)
-    val nextState = OperatorApplication(GetNextValueOp(), List(currentState))
-    // assume to ensure the havoc is a valid index within the valid bits vector
-    val isInRangeAssumes: Option[List[Statement]] =
-      hoaData.numStates.map(nStates =>
-        List[Statement](
-          AssumeStmt(
-            OperatorApplication(IntGEOp(), List(nextState, IntLit(0))),
-            None
-          ),
-          AssumeStmt(
-            OperatorApplication(IntLTOp(), List(nextState, IntLit(nStates))),
-            None
-          )
-        )
-      )
-    // assume to ensure that the bit indexed by the havoc var is a 1
-    val isValidTransitionAssume = AssumeStmt(
-      OperatorApplication(
-        EqualityOp(),
-        List(
-          BitVectorLit(1, 1),
-          OperatorApplication(
-            VarExtractOp(VarBitVectorSlice(IntLit(1), IntLit(1), Some(1))),
-            List(transitionBits)
-          )
-        )
-      ),
-      None
-    )
-    // statement to update the next state havoc -- TODO: Rename to havocState
-    val updateState = List[Statement](HavocStmt(HavocableId(currentState)))
+    // build the declarative transition relation expression
+    val transitionRelation = constructTransitionRelation(hoaData, currentState)
 
     val nextDecl: Option[NextDecl] =
       for {
-        isInRangeAssumes <- isInRangeAssumes
-        transitionBitsDecl <- transitionBitsDecl
-        updateTransitionBitsCall <- updateTransitionBitsCall
+        tr <- transitionRelation
       } yield NextDecl(
         BlockStmt(
-          List(transitionBitsDecl),
+          List.empty, // No local variables needed for the declarative approach
           List(
-            updateTransitionBitsCall
-          ) ++ updateState ++ isInRangeAssumes ++ List(
-            isValidTransitionAssume
+            HavocStmt(HavocableId(currentState)),
+            AssumeStmt(tr, None)
           )
         )
       )
@@ -1024,11 +918,9 @@ object LTLAutomataGenerator {
         inputVarDecls <- compatVarDecls
         nextDecl <- nextDecl
         neverHitAcceptStateSpecDecl <- neverHitAcceptStateSpecDecl
-        updateTransitionBitsDefinition <- updateTransitionBitsDefinition
       } yield List[Decl](typeImportDecl) ++ inputVarDecls ++ List[Decl](
         currentStateVarDecl,
         initDecl,
-        updateTransitionBitsDefinition,
         nextDecl,
         neverHitAcceptStateSpecDecl
       ) // all are Decl, list type is Decl
